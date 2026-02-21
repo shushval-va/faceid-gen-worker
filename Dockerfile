@@ -2,6 +2,8 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV HF_HUB_DOWNLOAD_TIMEOUT=300
+ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,6 +24,7 @@ RUN pip install --no-cache-dir \
     opencv-python \
     gfpgan \
     huggingface_hub==0.25.0 \
+    hf_transfer \
     && pip install --no-cache-dir --force-reinstall --no-deps \
     git+https://github.com/XPixelGroup/BasicSR@8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a
 
