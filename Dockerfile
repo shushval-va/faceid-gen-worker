@@ -8,6 +8,9 @@ RUN apt-get update && apt-get install -y \
     git libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Pin numpy<2 FIRST (torch 2.1.0 compiled against numpy 1.x, incompatible with 2.x)
+RUN pip install --no-cache-dir "numpy<2"
+
 # Python dependencies
 RUN pip install --no-cache-dir \
     runpod brotlicffi \
@@ -15,6 +18,7 @@ RUN pip install --no-cache-dir \
     transformers==4.36.2 \
     accelerate==0.26.1 \
     safetensors \
+    einops \
     insightface \
     onnxruntime-gpu==1.16.2 \
     opencv-python \
@@ -24,6 +28,17 @@ RUN pip install --no-cache-dir \
 RUN git clone https://github.com/tencent-ailab/IP-Adapter.git /app/IP-Adapter
 
 WORKDIR /app
+
+# Verify all imports work at build time (catches missing deps early)
+RUN python -c "\
+import numpy; print(f'numpy {numpy.__version__}'); \
+import torch; print(f'torch {torch.__version__}'); \
+from diffusers import DDIMScheduler, StableDiffusionXLPipeline; \
+from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection; \
+import cv2; import einops; import insightface; \
+import sys; sys.path.insert(0, '/app/IP-Adapter'); \
+from ip_adapter.ip_adapter_faceid import IPAdapterFaceIDPlusXL; \
+print('All imports OK')"
 
 # Download RealVisXL V4.0 (uncensored SDXL model)
 RUN python -c "\
