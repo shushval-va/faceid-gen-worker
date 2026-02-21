@@ -21,9 +21,10 @@ RUN pip install --no-cache-dir \
     gfpgan \
     huggingface_hub==0.25.0
 
-# Fix basicsr compatibility with torchvision >= 0.20 (functional_tensor removed)
-RUN sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
-    /opt/conda/lib/python3.11/site-packages/basicsr/data/degradations.py
+# Replace PyPI basicsr with patched version (official fix for torchvision >= 0.18 compat)
+# Must run AFTER gfpgan install to override the broken basicsr it pulls in
+RUN pip install --no-cache-dir --force-reinstall --no-deps \
+    git+https://github.com/XPixelGroup/BasicSR@8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a
 
 WORKDIR /app
 
