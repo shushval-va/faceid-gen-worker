@@ -1,137 +1,164 @@
-"""RunPod serverless handler for face-preserving image generation.
+"""
+RunPod Serverless Handler: NSFW Image Generation with Face Swap.
 
-Uses SDXL (RealVisXL) + IP-Adapter FaceID Plus V2 to generate images
-with a specific person's face from a reference photo.
-No NSFW filters.
+Two-step pipeline:
+1. Generate photorealistic image with SDXL (RealVisXL V5.0)
+2. Swap face from reference onto generated image (inswapper_128)
+3. Restore face quality (GFPGAN)
 """
 
 import base64
 import io
 import os
-import sys
 
 import cv2
 import numpy as np
+import runpod
 import torch
+from diffusers import DPMSolverMultistepScheduler, StableDiffusionXLPipeline
+from gfpgan import GFPGANer
+from insightface.app import FaceAnalysis
+from insightface.model_zoo import get_model as get_insightface_model
 from PIL import Image
 
-import runpod
+MODEL_DIR = "/app/models"
 
-sys.path.insert(0, "/app/IP-Adapter")
-
-from diffusers import DDIMScheduler, StableDiffusionXLPipeline
-from ip_adapter.ip_adapter_faceid import IPAdapterFaceIDPlusXL
-from insightface.app import FaceAnalysis
-
-# ---------------------------------------------------------------------------
-# Model loading (runs once at worker startup)
-# ---------------------------------------------------------------------------
-MODELS_DIR = "/app/models"
-
-print("Loading SDXL pipeline (RealVisXL V4.0)...")
-pipe = StableDiffusionXLPipeline.from_pretrained(
-    f"{MODELS_DIR}/RealVisXL_V4.0",
-    torch_dtype=torch.float16,
-)
-pipe.scheduler = DDIMScheduler(
-    num_train_timesteps=1000,
-    beta_start=0.00085,
-    beta_end=0.012,
-    beta_schedule="scaled_linear",
-    clip_sample=False,
-    set_alpha_to_one=False,
-    steps_offset=1,
-)
-
-print("Loading IP-Adapter FaceID Plus V2 for SDXL...")
-ip_model = IPAdapterFaceIDPlusXL(
-    pipe,
-    f"{MODELS_DIR}/CLIP-ViT-H-14",
-    f"{MODELS_DIR}/ip-adapter-faceid/ip-adapter-faceid-plusv2_sdxl.bin",
-    device="cuda",
-    torch_dtype=torch.float16,
-)
-
-print("Loading InsightFace (antelopev2)...")
-face_app = FaceAnalysis(
-    name="antelopev2",
-    root=f"{MODELS_DIR}/insightface",
-    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-)
-face_app.prepare(ctx_id=0, det_size=(640, 640))
-
-print("All models loaded.")
+pipe = None
+face_app = None
+swapper = None
+restorer = None
 
 
-# ---------------------------------------------------------------------------
-# Handler
-# ---------------------------------------------------------------------------
+def load_models():
+    global pipe, face_app, swapper, restorer
+
+    # SDXL pipeline (RealVisXL V5.0)
+    pipe = StableDiffusionXLPipeline.from_pretrained(
+        f"{MODEL_DIR}/RealVisXL_V5.0",
+        torch_dtype=torch.float16,
+        use_safetensors=True,
+    ).to("cuda")
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
+        pipe.scheduler.config, use_karras_sigmas=True
+    )
+
+    # InsightFace for face detection/recognition
+    face_app = FaceAnalysis(
+        name="buffalo_l",
+        root=f"{MODEL_DIR}/insightface",
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    face_app.prepare(ctx_id=0, det_size=(640, 640))
+
+    # inswapper_128 face swap model
+    swapper = get_insightface_model(
+        f"{MODEL_DIR}/inswapper_128.onnx",
+        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+
+    # GFPGAN face restorer
+    restorer = GFPGANer(
+        model_path=f"{MODEL_DIR}/GFPGANv1.4.pth",
+        upscale=1,
+        arch="clean",
+        channel_multiplier=2,
+        bg_upsampler=None,
+    )
+
+
+def decode_image(b64_string):
+    return Image.open(io.BytesIO(base64.b64decode(b64_string))).convert("RGB")
+
+
+def pil_to_cv2(img):
+    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+
+
+def cv2_to_pil(img):
+    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+
+
+def encode_image(img):
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode()
+
 
 def handler(event):
-    """
-    Input JSON:
-      face_image: base64 encoded face reference photo (required)
-      prompt: text prompt describing the desired image (required)
-      negative_prompt: text for negative prompt (optional)
-      face_scale: IP-Adapter face influence 0.0-1.5 (default 0.7)
-      structure_scale: face structure preservation scale (default 1.0)
-      guidance_scale: classifier-free guidance (default 7.5)
-      num_steps: denoising steps (default 30)
-      width: output width (default 768)
-      height: output height (default 1024)
-      seed: random seed (default 42)
-    """
-    try:
-        inp = event["input"]
+    inp = event["input"]
 
-        # Decode face image
-        face_pil = Image.open(
-            io.BytesIO(base64.b64decode(inp["face_image"]))
-        ).convert("RGB")
+    face_img = decode_image(inp["face_image"])
 
-        # Extract face embedding with InsightFace
-        face_cv = cv2.cvtColor(np.array(face_pil), cv2.COLOR_RGB2BGR)
-        faces = face_app.get(face_cv)
-        if not faces:
-            return {"error": "No face detected in the provided image"}
+    prompt = inp.get(
+        "prompt",
+        "beautiful woman, professional photo, natural lighting, detailed skin",
+    )
+    negative = inp.get(
+        "negative_prompt",
+        "bad hands, bad anatomy, ugly, deformed, face asymmetry, "
+        "deformed eyes, deformed mouth, low quality, blurry, "
+        "deformed fingers, extra fingers, missing fingers",
+    )
+    width = inp.get("width", 768)
+    height = inp.get("height", 1024)
+    steps = inp.get("num_steps", 30)
+    guidance = inp.get("guidance_scale", 7.0)
+    seed = inp.get("seed", -1)
+    do_restore = inp.get("restore_face", True)
 
-        faceid_embeds = torch.tensor(
-            faces[0].normed_embedding, dtype=torch.float32
-        ).unsqueeze(0)
+    generator = None
+    if seed >= 0:
+        generator = torch.Generator("cuda").manual_seed(seed)
 
-        # Generation parameters
-        prompt = inp.get(
-            "prompt",
-            "beautiful woman, professional photo, high quality, detailed",
-        )
-        negative_prompt = inp.get(
-            "negative_prompt",
-            "monochrome, lowres, bad anatomy, worst quality, low quality, "
-            "deformed, blurry, watermark, text",
-        )
+    # --- Step 1: Generate base image with SDXL ---
+    gen_image = pipe(
+        prompt=prompt,
+        negative_prompt=negative,
+        width=width,
+        height=height,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        generator=generator,
+    ).images[0]
 
-        images = ip_model.generate(
-            face_image=face_pil,
-            faceid_embeds=faceid_embeds,
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            scale=float(inp.get("face_scale", 0.7)),
-            s_scale=float(inp.get("structure_scale", 1.0)),
-            shortcut=True,
-            num_samples=1,
-            seed=int(inp.get("seed", 42)),
-            guidance_scale=float(inp.get("guidance_scale", 7.5)),
-            num_inference_steps=int(inp.get("num_steps", 30)),
-            width=int(inp.get("width", 768)),
-            height=int(inp.get("height", 1024)),
-        )
+    # --- Step 2: Face swap ---
+    gen_cv = pil_to_cv2(gen_image)
+    face_cv = pil_to_cv2(face_img)
 
-        buf = io.BytesIO()
-        images[0].save(buf, format="PNG")
-        return {"image": base64.b64encode(buf.getvalue()).decode()}
+    target_faces = face_app.get(gen_cv)
+    source_faces = face_app.get(face_cv)
 
-    except Exception as e:
-        return {"error": str(e)}
+    if not source_faces:
+        return {
+            "image": encode_image(gen_image),
+            "face_swapped": False,
+            "error": "No face detected in source image",
+        }
+
+    if not target_faces:
+        return {
+            "image": encode_image(gen_image),
+            "face_swapped": False,
+            "error": "No face detected in generated image",
+        }
+
+    # Pick largest face in generated image
+    target_faces = sorted(
+        target_faces,
+        key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]),
+        reverse=True,
+    )
+
+    swapped = swapper.get(gen_cv, target_faces[0], source_faces[0], paste_back=True)
+
+    # --- Step 3: Face restoration ---
+    if do_restore:
+        _, _, swapped = restorer.enhance(swapped, paste_back=True)
+
+    final = cv2_to_pil(swapped)
+
+    return {"image": encode_image(final), "face_swapped": True}
 
 
+load_models()
 runpod.serverless.start({"handler": handler})

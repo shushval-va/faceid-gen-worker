@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 # System dependencies
 RUN apt-get update && apt-get install -y \
-    git libgl1-mesa-glx libglib2.0-0 \
+    git wget libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Python dependencies (PyTorch 2.5.1 natively supports NumPy 2.x)
@@ -15,55 +15,53 @@ RUN pip install --no-cache-dir \
     transformers==4.46.0 \
     accelerate==1.1.0 \
     safetensors \
-    einops \
     insightface \
     onnxruntime-gpu==1.20.0 \
     opencv-python \
+    gfpgan \
     huggingface_hub==0.25.0
-
-# Clone IP-Adapter code (provides FaceID adapter classes)
-RUN git clone https://github.com/tencent-ailab/IP-Adapter.git /app/IP-Adapter
 
 WORKDIR /app
 
-# Verify all imports work at build time (catches missing deps early)
+# Verify all imports at build time
 RUN python -c "\
-import numpy; print(f'numpy {numpy.__version__}'); \
 import torch; print(f'torch {torch.__version__}'); \
-from diffusers import DDIMScheduler, StableDiffusionXLPipeline; \
-from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection; \
-import cv2; import einops; import insightface; \
-import sys; sys.path.insert(0, '/app/IP-Adapter'); \
-from ip_adapter.ip_adapter_faceid import IPAdapterFaceIDPlusXL; \
+import numpy; print(f'numpy {numpy.__version__}'); \
+from diffusers import StableDiffusionXLPipeline, DPMSolverMultistepScheduler; \
+import cv2; import insightface; \
+from gfpgan import GFPGANer; \
 print('All imports OK')"
 
-# Download RealVisXL V4.0 (uncensored SDXL model)
+# Download RealVisXL V5.0
 RUN python -c "\
 from huggingface_hub import snapshot_download; \
-snapshot_download('SG161222/RealVisXL_V4.0', \
-    local_dir='/app/models/RealVisXL_V4.0', \
+snapshot_download('SG161222/RealVisXL_V5.0', \
+    local_dir='/app/models/RealVisXL_V5.0', \
     ignore_patterns=['*.bin', '*.ckpt', '*non_ema*'])"
 
-# Download IP-Adapter FaceID Plus V2 weights for SDXL
-RUN python -c "\
-from huggingface_hub import hf_hub_download; \
-hf_hub_download('h94/IP-Adapter-FaceID', \
-    filename='ip-adapter-faceid-plusv2_sdxl.bin', \
-    local_dir='/app/models/ip-adapter-faceid')"
+# Download inswapper_128.onnx (face swap model)
+RUN mkdir -p /app/models && \
+    wget -q -O /app/models/inswapper_128.onnx \
+    https://huggingface.co/ashleykleynhans/inswapper/resolve/main/inswapper_128.onnx
 
-# Download CLIP ViT-H/14 image encoder (used by IP-Adapter Plus)
-RUN python -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('laion/CLIP-ViT-H-14-laion2B-s32B-b79K', \
-    local_dir='/app/models/CLIP-ViT-H-14')"
+# Download GFPGANv1.4 (face restoration)
+RUN wget -q -O /app/models/GFPGANv1.4.pth \
+    https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
 
-# Download InsightFace antelopev2 model for face embedding extraction
-RUN mkdir -p /app/models/insightface/models/antelopev2 && \
+# Download InsightFace buffalo_l models (face detection + recognition)
+RUN mkdir -p /app/models/insightface/models/buffalo_l && \
     python -c "\
 from huggingface_hub import hf_hub_download; \
-files = ['1k3d68.onnx', '2d106det.onnx', 'genderage.onnx', 'glintr100.onnx', 'scrfd_10g_bnkps.onnx']; \
-[hf_hub_download('DIAMONIK7777/antelopev2', filename=f, \
-    local_dir='/app/models/insightface/models/antelopev2') for f in files]"
+files = ['det_10g.onnx', '1k3d68.onnx', '2d106det.onnx', 'genderage.onnx', 'w600k_r50.onnx']; \
+[hf_hub_download('DIAMONIK7777/buffalo_l', filename=f, \
+    local_dir='/app/models/insightface/models/buffalo_l') for f in files]"
+
+# Pre-download facexlib detection models (used by GFPGAN internally)
+RUN python -c "\
+from gfpgan import GFPGANer; \
+r = GFPGANer(model_path='/app/models/GFPGANv1.4.pth', upscale=1, \
+    arch='clean', channel_multiplier=2, bg_upsampler=None); \
+print('GFPGAN initialized OK')"
 
 COPY handler.py /app/handler.py
 
