@@ -54,12 +54,14 @@ RUN wget -q -O /app/models/GFPGANv1.4.pth \
     https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
 
 # Download InsightFace buffalo_l models (face detection + recognition)
+# Using public-data/insightface mirror (DIAMONIK7777/buffalo_l went private)
 RUN mkdir -p /app/models/insightface/models/buffalo_l && \
     python -c "\
 from huggingface_hub import hf_hub_download; \
 files = ['det_10g.onnx', '1k3d68.onnx', '2d106det.onnx', 'genderage.onnx', 'w600k_r50.onnx']; \
-[hf_hub_download('DIAMONIK7777/buffalo_l', filename=f, \
-    local_dir='/app/models/insightface/models/buffalo_l') for f in files]"
+[hf_hub_download('public-data/insightface', filename=f, \
+    subfolder='models/buffalo_l', \
+    local_dir='/app/models/insightface') for f in files]"
 
 # Pre-download facexlib detection models (used by GFPGAN internally)
 RUN python -c "\
