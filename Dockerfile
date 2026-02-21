@@ -21,6 +21,10 @@ RUN pip install --no-cache-dir \
     gfpgan \
     huggingface_hub==0.25.0
 
+# Fix basicsr compatibility with torchvision >= 0.20 (functional_tensor removed)
+RUN sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
+    /opt/conda/lib/python3.11/site-packages/basicsr/data/degradations.py
+
 WORKDIR /app
 
 # Verify all imports at build time
