@@ -5,7 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 # System dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git wget libgl1-mesa-glx libglib2.0-0 \
+    git wget g++ libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
