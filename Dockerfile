@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -8,19 +8,16 @@ RUN apt-get update && apt-get install -y \
     git libgl1-mesa-glx libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin numpy<2 FIRST (torch 2.1.0 compiled against numpy 1.x, incompatible with 2.x)
-RUN pip install --no-cache-dir "numpy<2"
-
-# Python dependencies
+# Python dependencies (PyTorch 2.5.1 natively supports NumPy 2.x)
 RUN pip install --no-cache-dir \
     runpod brotlicffi \
-    diffusers==0.25.0 \
-    transformers==4.36.2 \
-    accelerate==0.26.1 \
+    diffusers==0.31.0 \
+    transformers==4.46.0 \
+    accelerate==1.1.0 \
     safetensors \
     einops \
     insightface \
-    onnxruntime-gpu==1.16.2 \
+    onnxruntime-gpu==1.20.0 \
     opencv-python \
     huggingface_hub==0.25.0
 
