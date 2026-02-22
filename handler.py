@@ -1,91 +1,165 @@
 """
-RunPod Serverless Handler: Image Generation with InstantID Face Identity.
+RunPod Serverless Handler: Flux + PuLID identity-preserving image generation.
 
-Pipeline: InstantID (face identity baked into SDXL generation)
-1. Extract face embedding + keypoints from reference image (antelopev2)
-2. Generate image with InstantID ControlNet + IP-Adapter
-3. Optional: GFPGAN face restoration
+Pipeline:
+1. Extract face ID embedding from face_image (PuLID: antelopev2 + EVA-CLIP)
+2. Encode prompt with T5 + CLIP text encoders
+3. Denoise with Flux DiT (fp8) + PuLID ID injection
+4. Decode latents with Flux VAE
 """
 
 import base64
+import gc
 import io
+import json
 import os
 import sys
+import time
 
-sys.path.insert(0, "/app/InstantID")
+sys.path.insert(0, "/app/PuLID")
 
-import cv2
 import numpy as np
 import runpod
 import torch
-from diffusers import DPMSolverMultistepScheduler
-from diffusers.models import ControlNetModel
-from gfpgan import GFPGANer
-from insightface.app import FaceAnalysis
+from einops import rearrange
 from PIL import Image
-from pipeline_stable_diffusion_xl_instantid import (
-    StableDiffusionXLInstantIDPipeline,
-    draw_kps,
-)
+from safetensors.torch import load_file as load_sft
+
+from flux.model import Flux
+from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack
+from flux.util import configs, load_ae, load_clip, load_t5
+from pulid.pipeline_flux import PuLIDPipeline
+from pulid.utils import resize_numpy_image_long
 
 MODEL_DIR = "/app/models"
 
-pipe = None
-face_app = None
-restorer = None
+model = None
+ae = None
+t5 = None
+clip = None
+pulid_model = None
+
+
+def merge_lora(state_dict, lora_path, scale=1.0):
+    """Merge LoRA weights into Flux state dict (before requantization).
+
+    Supports both BFL format (lora_down/lora_up) and
+    diffusers format (lora_A/lora_B) key naming.
+    """
+    lora_sd = load_sft(lora_path, device="cpu")
+
+    lora_keys_sample = list(lora_sd.keys())[:5]
+    model_keys_sample = list(state_dict.keys())[:5]
+    print(f"LoRA keys sample: {lora_keys_sample}")
+    print(f"Model keys sample: {model_keys_sample}")
+
+    down_keys = [
+        k for k in lora_sd
+        if k.endswith(".lora_down.weight") or k.endswith(".lora_A.weight")
+    ]
+    print(f"LoRA: found {len(down_keys)} down-projection layers")
+
+    applied, skipped = 0, []
+    for down_key in down_keys:
+        up_key = down_key.replace("lora_down", "lora_up").replace("lora_A", "lora_B")
+        if up_key not in lora_sd:
+            skipped.append(("no_up", down_key))
+            continue
+
+        base_key = (
+            down_key
+            .replace(".lora_down.weight", ".weight")
+            .replace(".lora_A.weight", ".weight")
+        )
+        if base_key not in state_dict:
+            skipped.append(("no_base", base_key))
+            continue
+
+        down = lora_sd[down_key].float()
+        up = lora_sd[up_key].float()
+        delta = (up @ down) * scale
+        state_dict[base_key] = state_dict[base_key].float() + delta
+        applied += 1
+
+    print(f"LoRA: {applied} layers merged, {len(skipped)} skipped")
+    if skipped[:10]:
+        print(f"  skipped (first 10): {skipped[:10]}")
+    del lora_sd
+    gc.collect()
+    return state_dict
+
+
+def load_flux_fp8(name="flux-dev", lora_path=None, lora_scale=1.0):
+    """Load Flux DiT in fp8 with optional LoRA merge."""
+    from huggingface_hub import hf_hub_download
+    from optimum.quanto import requantize
+
+    fp8_path = os.path.join(MODEL_DIR, "flux-dev-fp8.safetensors")
+    map_path = os.path.join(MODEL_DIR, "flux_dev_quantization_map.json")
+
+    if not os.path.exists(fp8_path):
+        fp8_path = hf_hub_download(
+            "XLabs-AI/flux-dev-fp8", "flux-dev-fp8.safetensors", local_dir=MODEL_DIR
+        )
+    if not os.path.exists(map_path):
+        map_path = hf_hub_download(
+            "XLabs-AI/flux-dev-fp8", "flux_dev_quantization_map.json",
+            local_dir=MODEL_DIR,
+        )
+
+    print("Loading fp8 state dict...")
+    sd = load_sft(fp8_path, device="cpu")
+
+    if lora_path and os.path.exists(lora_path):
+        print(f"Merging LoRA from {lora_path} (scale={lora_scale})...")
+        sd = merge_lora(sd, lora_path, scale=lora_scale)
+
+    print("Creating Flux model + requantizing to fp8...")
+    flux_model = Flux(configs[name].params).to(torch.bfloat16)
+    with open(map_path) as f:
+        qmap = json.load(f)
+    requantize(flux_model, sd, qmap, device="cpu")
+
+    del sd
+    gc.collect()
+    return flux_model
 
 
 def load_models():
-    global pipe, face_app, restorer
+    """Initialize all models. Called once at worker startup."""
+    global model, ae, t5, clip, pulid_model
+    device = "cuda"
 
-    # InstantID ControlNet
-    controlnet = ControlNetModel.from_pretrained(
-        f"{MODEL_DIR}/InstantID/ControlNetModel",
-        torch_dtype=torch.float16,
+    lora_path = os.path.join(MODEL_DIR, "nsfw_lora.safetensors")
+    model = load_flux_fp8(
+        "flux-dev",
+        lora_path=lora_path if os.path.exists(lora_path) else None,
+        lora_scale=1.0,
     )
+    model.eval()
 
-    # SDXL + InstantID pipeline (RealVisXL V5.0)
-    pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
-        f"{MODEL_DIR}/RealVisXL_V5.0",
-        controlnet=controlnet,
-        torch_dtype=torch.float16,
-        use_safetensors=True,
-    ).to("cuda")
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(
-        pipe.scheduler.config, use_karras_sigmas=True
+    print("Loading T5 + CLIP text encoders...")
+    t5_enc = load_t5(device, max_length=128)
+    clip_enc = load_clip(device)
+    t5 = t5_enc
+    clip = clip_enc
+
+    print("Loading Flux VAE...")
+    ae = load_ae("flux-dev", device="cpu")
+
+    print("Initializing PuLID pipeline...")
+    pulid_model = PuLIDPipeline(
+        model, device="cpu", weight_dtype=torch.bfloat16, onnx_provider="gpu",
     )
-
-    # Load InstantID IP-Adapter
-    pipe.load_ip_adapter_instantid(f"{MODEL_DIR}/InstantID/ip-adapter.bin")
-
-    # InsightFace antelopev2 for face detection/embedding
-    face_app = FaceAnalysis(
-        name="antelopev2",
-        root=f"{MODEL_DIR}/insightface",
-        providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+    pulid_model.face_helper.face_det.mean_tensor = (
+        pulid_model.face_helper.face_det.mean_tensor.to(device)
     )
-    face_app.prepare(ctx_id=0, det_size=(640, 640))
+    pulid_model.face_helper.face_det.device = torch.device(device)
+    pulid_model.face_helper.device = torch.device(device)
+    pulid_model.device = torch.device(device)
+    pulid_model.load_pretrain(version="v0.9.1")
 
-    # GFPGAN face restorer
-    restorer = GFPGANer(
-        model_path=f"{MODEL_DIR}/GFPGANv1.4.pth",
-        upscale=1,
-        arch="clean",
-        channel_multiplier=2,
-        bg_upsampler=None,
-    )
-
-
-def decode_image(b64_string):
-    return Image.open(io.BytesIO(base64.b64decode(b64_string))).convert("RGB")
-
-
-def pil_to_cv2(img):
-    return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-
-def cv2_to_pil(img):
-    return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    print("All models loaded OK.")
 
 
 def encode_image(img):
@@ -97,70 +171,105 @@ def encode_image(img):
 def handler(event):
     inp = event["input"]
 
-    face_img = decode_image(inp["face_image"])
+    face_b64 = inp.get("face_image")
+    if not face_b64:
+        return {"error": "face_image is required"}
 
-    prompt = inp.get(
-        "prompt",
-        "beautiful woman, professional photo, natural lighting, detailed skin",
-    )
-    negative = inp.get(
+    face_pil = Image.open(io.BytesIO(base64.b64decode(face_b64))).convert("RGB")
+    face_np = np.array(face_pil)
+    face_np = resize_numpy_image_long(face_np, 1024)
+
+    prompt = inp.get("prompt", "portrait, color, cinematic, professional photo")
+    neg_prompt = inp.get(
         "negative_prompt",
-        "bad hands, bad anatomy, ugly, deformed, face asymmetry, "
-        "deformed eyes, deformed mouth, low quality, blurry, "
-        "deformed fingers, extra fingers, missing fingers",
+        "bad quality, worst quality, text, signature, watermark, extra limbs",
     )
-    width = inp.get("width", 768)
-    height = inp.get("height", 1024)
-    steps = inp.get("num_steps", 30)
-    guidance = inp.get("guidance_scale", 5.0)
+    width = inp.get("width", 896)
+    height = inp.get("height", 1152)
+    num_steps = inp.get("num_steps", 20)
+    start_step = inp.get("start_step", 4)
+    guidance = inp.get("guidance_scale", 4.0)
     seed = inp.get("seed", -1)
-    do_restore = inp.get("restore_face", True)
-    identity_scale = inp.get("identity_scale", 0.8)
-    controlnet_scale = inp.get("controlnet_scale", 0.8)
+    id_weight = inp.get("id_weight", 1.0)
+    true_cfg = inp.get("true_cfg", 1.0)
+    max_seq_len = inp.get("max_sequence_length", 128)
 
-    generator = None
-    if seed >= 0:
-        generator = torch.Generator("cuda").manual_seed(seed)
+    if seed == -1:
+        seed = int(torch.Generator(device="cpu").seed())
 
-    # --- Step 1: Extract face identity from reference ---
-    face_cv = cv2.cvtColor(np.array(face_img), cv2.COLOR_RGB2BGR)
-    faces = face_app.get(face_cv)
+    device = torch.device("cuda")
+    t0 = time.perf_counter()
 
-    if not faces:
-        return {"image": "", "error": "No face detected in reference image"}
+    use_true_cfg = abs(true_cfg - 1.0) > 1e-2
 
-    # Use largest face
-    face_info = sorted(
-        faces,
-        key=lambda x: (x["bbox"][2] - x["bbox"][0]) * (x["bbox"][3] - x["bbox"][1]),
-    )[-1]
+    with torch.inference_mode():
+        # --- Step 1: Prepare noise + timesteps ---
+        x = get_noise(1, height, width, device=device, dtype=torch.bfloat16, seed=seed)
+        timesteps = get_schedule(num_steps, x.shape[-1] * x.shape[-2] // 4, shift=True)
 
-    face_emb = face_info["embedding"]
-    face_kps = draw_kps(face_img, face_info["kps"])
+        # --- Step 2: Encode prompt (T5 + CLIP on GPU) ---
+        t5.max_length = max_seq_len
+        t5.to(device)
+        clip.to(device)
+        inp_cond = prepare(t5=t5, clip=clip, img=x, prompt=prompt)
+        inp_neg = (
+            prepare(t5=t5, clip=clip, img=x, prompt=neg_prompt)
+            if use_true_cfg else None
+        )
+        t5.cpu()
+        clip.cpu()
+        torch.cuda.empty_cache()
 
-    # --- Step 2: Generate image with InstantID ---
-    pipe.set_ip_adapter_scale(identity_scale)
+        # --- Step 3: Extract face ID embedding (PuLID) ---
+        pulid_model.components_to_device(device)
+        try:
+            id_emb, uncond_id_emb = pulid_model.get_id_embedding(
+                face_np, cal_uncond=use_true_cfg,
+            )
+        except RuntimeError as e:
+            pulid_model.components_to_device(torch.device("cpu"))
+            torch.cuda.empty_cache()
+            return {"error": f"Face detection failed: {e}"}
 
-    image = pipe(
-        prompt=prompt,
-        negative_prompt=negative,
-        image_embeds=face_emb,
-        image=face_kps,
-        controlnet_conditioning_scale=controlnet_scale,
-        width=width,
-        height=height,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        generator=generator,
-    ).images[0]
+        pulid_model.components_to_device(torch.device("cpu"))
+        torch.cuda.empty_cache()
 
-    # --- Step 3: Optional face restoration ---
-    if do_restore:
-        img_cv = pil_to_cv2(image)
-        _, _, restored = restorer.enhance(img_cv, paste_back=True)
-        image = cv2_to_pil(restored)
+        # --- Step 4: Denoise (Flux DiT on GPU) ---
+        model.to(device)
+        x = denoise(
+            model,
+            **inp_cond,
+            timesteps=timesteps,
+            guidance=guidance,
+            id=id_emb,
+            id_weight=id_weight,
+            start_step=start_step,
+            uncond_id=uncond_id_emb,
+            true_cfg=true_cfg,
+            timestep_to_start_cfg=1,
+            neg_txt=inp_neg["txt"] if use_true_cfg else None,
+            neg_txt_ids=inp_neg["txt_ids"] if use_true_cfg else None,
+            neg_vec=inp_neg["vec"] if use_true_cfg else None,
+        )
+        model.cpu()
+        torch.cuda.empty_cache()
 
-    return {"image": encode_image(image), "face_preserved": True}
+        # --- Step 5: Decode latents (VAE on GPU) ---
+        ae.decoder.to(device)
+        x = unpack(x.float(), height, width)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            x = ae.decode(x)
+        ae.decoder.cpu()
+        torch.cuda.empty_cache()
+
+    x = x.clamp(-1, 1)
+    x = rearrange(x[0], "c h w -> h w c")
+    img = Image.fromarray((127.5 * (x + 1.0)).cpu().byte().numpy())
+
+    t1 = time.perf_counter()
+    print(f"Generated in {t1 - t0:.1f}s (seed={seed})")
+
+    return {"image": encode_image(img), "seed": seed}
 
 
 load_models()

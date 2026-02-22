@@ -2,7 +2,7 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV HF_HUB_DOWNLOAD_TIMEOUT=300
+ENV HF_HUB_DOWNLOAD_TIMEOUT=600
 ENV HF_HUB_ENABLE_HF_TRANSFER=1
 
 # System dependencies
@@ -12,61 +12,117 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Python deps + patched basicsr (single layer)
+# Python deps for Flux + PuLID
 RUN pip install --no-cache-dir \
     runpod brotlicffi \
-    diffusers==0.31.0 \
-    transformers==4.46.0 \
-    accelerate==1.1.0 \
+    diffusers==0.30.0 \
+    transformers==4.43.3 \
+    accelerate \
     safetensors \
     insightface \
     onnxruntime-gpu==1.20.0 \
     opencv-python \
-    gfpgan \
     huggingface_hub==0.25.0 \
     hf_transfer \
-    && pip install --no-cache-dir --force-reinstall --no-deps \
-    git+https://github.com/XPixelGroup/BasicSR@8d56e3a045f9fb3e1d8872f92ee4a4f07f886b0a
+    einops \
+    timm \
+    ftfy \
+    facexlib \
+    sentencepiece \
+    optimum-quanto==0.2.4 \
+    torchsde
 
-# Clone InstantID repo (only pipeline + ip_adapter code needed)
-RUN git clone --depth 1 https://github.com/instantX-research/InstantID.git /app/InstantID \
-    && rm -rf /app/InstantID/.git /app/InstantID/gradio_demo /app/InstantID/examples /app/InstantID/assets
+# Clone PuLID repo (Flux + identity pipeline)
+RUN git clone --depth 1 https://github.com/ToTheBeginning/PuLID.git /app/PuLID \
+    && rm -rf /app/PuLID/.git /app/PuLID/example_inputs /app/PuLID/docs
 
 # Verify all imports at build time
 RUN python -c "\
-import sys; sys.path.insert(0, '/app/InstantID'); \
+import sys; sys.path.insert(0, '/app/PuLID'); \
 import torch; print(f'torch {torch.__version__}'); \
-from diffusers.models import ControlNetModel; \
-from pipeline_stable_diffusion_xl_instantid import StableDiffusionXLInstantIDPipeline, draw_kps; \
-import cv2; import insightface; from gfpgan import GFPGANer; \
+from flux.model import Flux; \
+from flux.sampling import denoise, get_noise, get_schedule, prepare, unpack; \
+from flux.util import configs, load_ae, load_clip, load_t5; \
+from pulid.pipeline_flux import PuLIDPipeline; \
+from einops import rearrange; \
+import cv2; import insightface; \
 print('All imports OK')"
 
-# Download all models in a single layer to reduce image size
-RUN python -c "\
-from huggingface_hub import snapshot_download, hf_hub_download; \
-print('--- RealVisXL V5.0 ---'); \
-snapshot_download('SG161222/RealVisXL_V5.0', \
-    local_dir='/app/models/RealVisXL_V5.0', \
-    ignore_patterns=['*.bin', '*.ckpt', '*non_ema*']); \
-print('--- InstantID ControlNet + IP-Adapter ---'); \
-hf_hub_download('InstantX/InstantID', filename='ControlNetModel/config.json', \
-    local_dir='/app/models/InstantID'); \
-hf_hub_download('InstantX/InstantID', filename='ControlNetModel/diffusion_pytorch_model.safetensors', \
-    local_dir='/app/models/InstantID'); \
-hf_hub_download('InstantX/InstantID', filename='ip-adapter.bin', \
-    local_dir='/app/models/InstantID'); \
-print('--- antelopev2 ---'); \
-snapshot_download('kidyu/antelopev2-for-InstantID-ComfyUI', \
-    local_dir='/app/models/insightface/models/antelopev2')" \
-    && wget -q -O /app/models/GFPGANv1.4.pth \
-    https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth
+# --- Model downloads (split into layers for Docker cache) ---
 
-# Pre-download facexlib detection models (used by GFPGAN internally)
+# Layer 1: Flux Dev fp8 (~12GB) — largest download, cached first
 RUN python -c "\
-from gfpgan import GFPGANer; \
-GFPGANer(model_path='/app/models/GFPGANv1.4.pth', upscale=1, \
-    arch='clean', channel_multiplier=2, bg_upsampler=None); \
-print('GFPGAN initialized OK')"
+from huggingface_hub import hf_hub_download; \
+print('--- Flux Dev fp8 ---'); \
+hf_hub_download('XLabs-AI/flux-dev-fp8', 'flux-dev-fp8.safetensors', \
+    local_dir='/app/models'); \
+hf_hub_download('XLabs-AI/flux-dev-fp8', 'flux_dev_quantization_map.json', \
+    local_dir='/app/models'); \
+print('Flux Dev fp8 OK')"
+
+# Layer 2: Flux VAE (gated model — needs HF_TOKEN with accepted license)
+ARG HF_TOKEN=""
+RUN python -c "\
+import os; \
+token = '${HF_TOKEN}' or os.environ.get('HF_TOKEN') or None; \
+from huggingface_hub import hf_hub_download; \
+print('--- Flux VAE ---'); \
+hf_hub_download('black-forest-labs/FLUX.1-dev', 'ae.safetensors', \
+    local_dir='/app/models', token=token if token else None); \
+print('VAE OK')"
+
+# Layer 3: T5 + CLIP text encoders (~10GB total)
+RUN python -c "\
+import sys; sys.path.insert(0, '/app/PuLID'); \
+from flux.util import load_t5, load_clip; \
+print('--- T5 encoder ---'); \
+t5 = load_t5('cpu', max_length=128); \
+print('--- CLIP encoder ---'); \
+clip = load_clip('cpu'); \
+print('Text encoders OK')"
+
+# Layer 4: PuLID model + antelopev2 (public mirror) + facexlib + EVA-CLIP
+# NOTE: PuLID hardcodes DIAMONIK7777/antelopev2 (private), so we pre-download
+# from a public mirror to the path PuLID expects (models/antelopev2/ from CWD).
+RUN python -c "\
+from huggingface_hub import hf_hub_download, snapshot_download; \
+print('--- PuLID model ---'); \
+hf_hub_download('guozinan/PuLID', 'pulid_flux_v0.9.1.safetensors', \
+    local_dir='models'); \
+print('--- antelopev2 (public mirror) ---'); \
+snapshot_download('kidyu/antelopev2-for-InstantID-ComfyUI', \
+    local_dir='models/antelopev2'); \
+print('PuLID + antelopev2 OK')"
+
+# Pre-download facexlib detection/parsing models
+RUN python -c "\
+from facexlib.utils.face_restoration_helper import FaceRestoreHelper; \
+from facexlib.parsing import init_parsing_model; \
+helper = FaceRestoreHelper(upscale_factor=1, face_size=512, crop_ratio=(1,1), \
+    det_model='retinaface_resnet50', save_ext='png', device='cpu'); \
+helper.face_parse = init_parsing_model(model_name='bisenet', device='cpu'); \
+print('facexlib OK')"
+
+# Pre-download EVA-CLIP model (used by PuLID for face features)
+RUN python -c "\
+import sys; sys.path.insert(0, '/app/PuLID'); \
+from eva_clip import create_model_and_transforms; \
+model, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', 'eva_clip', \
+    force_custom_clip=True); \
+print('EVA-CLIP OK')"
+
+# Layer 5: NSFW LoRA (~687MB)
+RUN python -c "\
+from huggingface_hub import hf_hub_download; \
+print('--- NSFW LoRA ---'); \
+hf_hub_download('enhanceaiteam/Flux-Uncensored-V2', 'lora.safetensors', \
+    local_dir='/app/models'); \
+print('NSFW LoRA OK')" \
+    && mv /app/models/lora.safetensors /app/models/nsfw_lora.safetensors \
+    || echo "WARNING: NSFW LoRA download failed (may need HF auth for sensitive content)"
+
+# Prevent runtime downloads — all models must be pre-cached above
+ENV HF_HUB_OFFLINE=1
 
 COPY handler.py /app/handler.py
 
