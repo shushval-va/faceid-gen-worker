@@ -50,6 +50,10 @@ print('All imports OK')"
 
 # --- Model downloads (split into layers for Docker cache) ---
 
+# HF_TOKEN needed for gated models (FLUX.1-dev VAE) and sensitive content (NSFW LoRA)
+ARG HF_TOKEN=""
+ENV HF_TOKEN=${HF_TOKEN}
+
 # Layer 1: Flux Dev fp8 (~12GB) — largest download, cached first
 RUN python -c "\
 from huggingface_hub import hf_hub_download; \
@@ -60,15 +64,12 @@ hf_hub_download('XLabs-AI/flux-dev-fp8', 'flux_dev_quantization_map.json', \
     local_dir='/app/models'); \
 print('Flux Dev fp8 OK')"
 
-# Layer 2: Flux VAE (gated model — needs HF_TOKEN with accepted license)
-ARG HF_TOKEN=""
+# Layer 2: Flux VAE (gated — HF_TOKEN with accepted license required)
 RUN python -c "\
-import os; \
-token = '${HF_TOKEN}' or os.environ.get('HF_TOKEN') or None; \
 from huggingface_hub import hf_hub_download; \
 print('--- Flux VAE ---'); \
 hf_hub_download('black-forest-labs/FLUX.1-dev', 'ae.safetensors', \
-    local_dir='/app/models', token=token if token else None); \
+    local_dir='/app/models'); \
 print('VAE OK')"
 
 # Layer 3: T5 + CLIP text encoders (~10GB total)
@@ -122,7 +123,9 @@ print('NSFW LoRA OK')" \
     || echo "WARNING: NSFW LoRA download failed (may need HF auth for sensitive content)"
 
 # Prevent runtime downloads — all models must be pre-cached above
+# Also clear HF_TOKEN from image (security)
 ENV HF_HUB_OFFLINE=1
+ENV HF_TOKEN=""
 
 COPY handler.py /app/handler.py
 
