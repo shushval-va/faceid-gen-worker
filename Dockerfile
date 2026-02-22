@@ -50,10 +50,6 @@ print('All imports OK')"
 
 # --- Model downloads (split into layers for Docker cache) ---
 
-# HF_TOKEN passed as build-arg for gated/sensitive downloads.
-# NOT stored as ENV — only used as shell var in specific RUN commands.
-ARG HF_TOKEN=""
-
 # Layer 1: Flux Dev fp8 (~12GB) — largest download, cached first
 RUN python -c "\
 from huggingface_hub import hf_hub_download; \
@@ -64,13 +60,8 @@ hf_hub_download('XLabs-AI/flux-dev-fp8', 'flux_dev_quantization_map.json', \
     local_dir='/app/models'); \
 print('Flux Dev fp8 OK')"
 
-# Layer 2: Flux VAE (gated — HF_TOKEN with accepted license required)
-RUN HF_TOKEN="${HF_TOKEN}" python -c "\
-from huggingface_hub import hf_hub_download; \
-print('--- Flux VAE ---'); \
-hf_hub_download('black-forest-labs/FLUX.1-dev', 'ae.safetensors', \
-    local_dir='/app/models'); \
-print('VAE OK')"
+# Layer 2: Flux VAE + NSFW LoRA — downloaded at RUNTIME via HF_TOKEN env var
+# (RunPod serverless doesn't support Docker build args)
 
 # Layer 3: T5 + CLIP text encoders (~10GB total)
 RUN python -c "\
@@ -112,18 +103,9 @@ model, _, _ = create_model_and_transforms('EVA02-CLIP-L-14-336', 'eva_clip', \
     force_custom_clip=True); \
 print('EVA-CLIP OK')"
 
-# Layer 5: NSFW LoRA (~687MB)
-RUN HF_TOKEN="${HF_TOKEN}" python -c "\
-from huggingface_hub import hf_hub_download; \
-print('--- NSFW LoRA ---'); \
-hf_hub_download('enhanceaiteam/Flux-Uncensored-V2', 'lora.safetensors', \
-    local_dir='/app/models'); \
-print('NSFW LoRA OK')" \
-    && mv /app/models/lora.safetensors /app/models/nsfw_lora.safetensors \
-    || echo "WARNING: NSFW LoRA download failed (may need HF auth for sensitive content)"
-
-# Prevent runtime downloads — all models must be pre-cached above
-ENV HF_HUB_OFFLINE=1
+# NOTE: Flux VAE (ae.safetensors) and NSFW LoRA require HF_TOKEN
+# for gated/sensitive content. They are downloaded at first cold start
+# via handler.py using HF_TOKEN from RunPod environment variables.
 
 COPY handler.py /app/handler.py
 

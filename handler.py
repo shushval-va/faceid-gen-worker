@@ -40,6 +40,42 @@ clip = None
 pulid_model = None
 
 
+def download_gated_models():
+    """Download models that require HF_TOKEN (gated/sensitive content).
+    Skips if files already exist. Called once at startup.
+    """
+    from huggingface_hub import hf_hub_download
+
+    vae_path = os.path.join(MODEL_DIR, "ae.safetensors")
+    lora_path = os.path.join(MODEL_DIR, "nsfw_lora.safetensors")
+
+    if not os.path.exists(vae_path):
+        print("Downloading Flux VAE (gated, requires HF_TOKEN)...")
+        hf_hub_download(
+            "black-forest-labs/FLUX.1-dev", "ae.safetensors",
+            local_dir=MODEL_DIR,
+        )
+        print("Flux VAE OK")
+    else:
+        print("Flux VAE already cached")
+
+    if not os.path.exists(lora_path):
+        print("Downloading NSFW LoRA (sensitive, requires HF_TOKEN)...")
+        try:
+            hf_hub_download(
+                "enhanceaiteam/Flux-Uncensored-V2", "lora.safetensors",
+                local_dir=MODEL_DIR,
+            )
+            os.rename(
+                os.path.join(MODEL_DIR, "lora.safetensors"), lora_path,
+            )
+            print("NSFW LoRA OK")
+        except Exception as e:
+            print(f"WARNING: NSFW LoRA download failed: {e}")
+    else:
+        print("NSFW LoRA already cached")
+
+
 def merge_lora(state_dict, lora_path, scale=1.0):
     """Merge LoRA weights into Flux state dict (before requantization).
 
@@ -272,5 +308,6 @@ def handler(event):
     return {"image": encode_image(img), "seed": seed}
 
 
+download_gated_models()
 load_models()
 runpod.serverless.start({"handler": handler})
